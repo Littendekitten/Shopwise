@@ -165,17 +165,21 @@ main { flex: 1; width: 100%; max-width: 1100px; margin: 0 auto; padding: 1rem; o
   padding: 0.7rem 1.1rem; border-radius: 10px; border: 1px solid transparent;
   font: inherit; font-weight: 700; cursor: pointer; text-decoration: none; line-height: 1.2;
 }
+.btn[disabled] { opacity: 0.6; cursor: not-allowed; }
 .btn-primary { background: var(--brand); color: #fff; }
 .btn-primary:hover { background: var(--brand-dark); }
 .btn-secondary { background: #fff; color: var(--ink); border-color: var(--line); }
 .btn-secondary:hover { border-color: var(--brand); }
 .btn-danger { background: #fff; color: var(--danger); border-color: #fecaca; }
 .btn-danger:hover { background: var(--danger-soft); }
+.btn-google { background: #fff; color: #1f2937; border-color: #cbd5e1; }
+.btn-google:hover { background: #f8fafc; border-color: #94a3b8; }
 .btn-block { width: 100%; }
 .btn-link {
   background: none; border: 0; padding: 0; color: var(--danger); font: inherit;
   cursor: pointer; text-decoration: underline; font-size: 0.9rem;
 }
+.btn-link.neutral { color: var(--brand-dark); }
 
 .stepper {
   display: inline-flex; align-items: center; justify-content: space-between;
@@ -257,6 +261,12 @@ legend { font-weight: 800; font-size: 1.05rem; margin-bottom: 0.6rem; padding: 0
 
 .auth-wrap { max-width: 440px; margin: 1rem auto; }
 .auth-wrap .alt { text-align: center; margin-top: 1rem; font-size: 0.95rem; }
+.divider {
+  display: flex; align-items: center; gap: 0.75rem; margin: 1rem 0;
+  color: var(--muted); font-size: 0.9rem;
+}
+.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.forgot { margin: 0.6rem 0 0; text-align: right; }
 
 .confirm-icon { font-size: 3rem; text-align: center; }
 .address-box { background: var(--bg); border-radius: 10px; padding: 0.8rem 1rem; line-height: 1.6; }

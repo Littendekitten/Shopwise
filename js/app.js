@@ -1,7 +1,8 @@
-/* Shopwise – applicatielogica (alleen Nederlands, demo) */
+/* Shopwise – applicatielogica (alleen Nederlands, demo), met Firebase */
 (function () {
   'use strict';
 
+  var cloud = window.ShopwiseCloud || null;
   var PRODUCTS = window.SHOPWISE_PRODUCTS || [];
   var CATEGORIES = window.SHOPWISE_CATEGORIES || [];
 
@@ -10,9 +11,9 @@
   var MAX_AANTAL = 20;
 
   var GAST_MAND = 'shopwise_mand_gast';
-  var GEBRUIKERS = 'shopwise_gebruikers';
-  var SESSIE = 'shopwise_sessie';
   var BESTELLING = 'shopwise_bestelling';
+
+  var CLOUD_UIT = 'Inloggen is op dit moment niet beschikbaar. Controleer je internetverbinding en laad de pagina opnieuw.';
 
   var app = document.getElementById('app');
   var toastEl = document.getElementById('toast');
@@ -20,6 +21,17 @@
   var zoekformulier = document.getElementById('zoekformulier');
 
   var state = { query: '', categorie: 'alle', sortering: 'aanbevolen' };
+
+  /* Accountstatus (komt uit Firebase) */
+  var gebruiker = null;            // { uid, naam, email, provider } of null
+  var accountMand = {};            // winkelmand van de ingelogde gebruiker
+  var opgeslagenAdres = null;      // bezorgadres uit Firestore
+  var mandGeladen = true;          // false zolang de cloud-gegevens laden
+  var cloudOk = true;              // false als laden uit Firestore mislukte
+  var authKlaar = false;           // true zodra we weten of iemand is ingelogd
+  var syncTeller = 0;
+  var opslagTimer = null;
+  var opslagOpen = false;
 
   var productMap = {};
   PRODUCTS.forEach(function (p) { productMap[p.id] = p; });
@@ -39,7 +51,7 @@
   function eur(cents) { return euroFormatter.format(cents / 100); }
 
   function normaliseer(s) {
-    return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+    return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
   }
 
   function hoofdletter(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
@@ -66,63 +78,25 @@
   };
 
   var toastTimer = null;
-  function toast(tekst) {
+  function toast(tekst, duur) {
     toastEl.textContent = tekst;
     toastEl.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, 2200);
+    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, duur || 2200);
   }
 
   function gaNaar(pad) {
     if (location.hash === '#' + pad) route(); else location.hash = '#' + pad;
   }
 
-  /* ---------- Gebruikers ---------- */
-
-  function getGebruikers() {
-    var lijst = store.get(GEBRUIKERS, []);
-    return Array.isArray(lijst) ? lijst : [];
+  function toonLaden() {
+    app.innerHTML = '<div class="empty"><span class="big" aria-hidden="true">🛒</span>' +
+      '<p class="muted" role="status">Even laden…</p></div>';
   }
-
-  function huidigeGebruiker() {
-    var email = store.get(SESSIE, null);
-    if (!email) return null;
-    var gevonden = getGebruikers().filter(function (u) { return u.email === email; })[0];
-    return gevonden || null;
-  }
-
-  function maakSalt() {
-    try {
-      var arr = new Uint8Array(12);
-      crypto.getRandomValues(arr);
-      return Array.prototype.map.call(arr, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
-    } catch (e) {
-      return String(Math.random()).slice(2) + String(Date.now());
-    }
-  }
-
-  function hashWachtwoord(wachtwoord, salt) {
-    var tekst = salt + ':' + wachtwoord;
-    if (window.crypto && window.crypto.subtle && window.TextEncoder) {
-      return crypto.subtle.digest('SHA-256', new TextEncoder().encode(tekst)).then(function (buf) {
-        return Array.prototype.map.call(new Uint8Array(buf), function (b) {
-          return ('0' + b.toString(16)).slice(-2);
-        }).join('');
-      });
-    }
-    var h = 5381;
-    for (var i = 0; i < tekst.length; i++) { h = ((h << 5) + h + tekst.charCodeAt(i)) | 0; }
-    return Promise.resolve('x' + (h >>> 0).toString(16));
-  }
-
-  function adresSleutel(email) { return 'shopwise_adres_' + email; }
 
   /* ---------- Winkelmand ---------- */
 
-  function mandSleutel() {
-    var u = huidigeGebruiker();
-    return u ? 'shopwise_mand_' + u.email : GAST_MAND;
-  }
+  function cacheSleutel(uid) { return 'shopwise_mand_' + uid; }
 
   function schoonMand(raw) {
     var schoon = {};
@@ -135,11 +109,46 @@
     return schoon;
   }
 
-  function getMand() { return schoonMand(store.get(mandSleutel(), {})); }
-  function setMand(mand) { store.set(mandSleutel(), mand); }
+  function getMand() {
+    if (gebruiker) return schoonMand(accountMand);
+    return schoonMand(store.get(GAST_MAND, {}));
+  }
+
+  function setMand(mand) {
+    if (gebruiker) {
+      accountMand = mand;
+      store.set(cacheSleutel(gebruiker.uid), mand);   // lokale reserve-kopie
+      plannenOpslag();
+    } else {
+      store.set(GAST_MAND, mand);
+    }
+  }
+
+  function plannenOpslag() {
+    if (!cloud || !gebruiker || !cloudOk) return;
+    opslagOpen = true;
+    clearTimeout(opslagTimer);
+    opslagTimer = setTimeout(spoelOpslag, 500);
+  }
+
+  function spoelOpslag() {
+    clearTimeout(opslagTimer);
+    if (!opslagOpen || !cloud || !gebruiker || !cloudOk) {
+      opslagOpen = false;
+      return Promise.resolve();
+    }
+    opslagOpen = false;
+    return cloud.bewaarMand(gebruiker.uid, schoonMand(accountMand)).catch(function () {
+      toast('Je winkelmand kon niet worden opgeslagen in je account.', 4000);
+    });
+  }
 
   function wijzigAantal(id, delta) {
-    if (!productMap[id]) return;
+    if (!productMap[id]) return false;
+    if (gebruiker && !mandGeladen) {
+      toast('Je winkelmand wordt nog geladen…');
+      return false;
+    }
     var mand = getMand();
     var nieuw = (mand[id] || 0) + delta;
     if (nieuw > MAX_AANTAL) {
@@ -148,23 +157,13 @@
     }
     if (nieuw <= 0) delete mand[id]; else mand[id] = nieuw;
     setMand(mand);
+    return true;
   }
 
   function verwijderUitMand(id) {
     var mand = getMand();
     delete mand[id];
     setMand(mand);
-  }
-
-  function voegGastMandSamen() {
-    var gast = schoonMand(store.get(GAST_MAND, {}));
-    if (!Object.keys(gast).length) return;
-    var gebruiker = schoonMand(store.get(mandSleutel(), {}));
-    Object.keys(gast).forEach(function (id) {
-      gebruiker[id] = Math.min((gebruiker[id] || 0) + gast[id], MAX_AANTAL);
-    });
-    store.set(mandSleutel(), gebruiker);
-    store.remove(GAST_MAND);
   }
 
   function berekenTotalen() {
@@ -179,6 +178,72 @@
     return { regels: regels, subtotaal: subtotaal, bezorg: bezorg, totaal: subtotaal + bezorg, aantal: aantal };
   }
 
+  /* ---------- Synchronisatie met Firebase ---------- */
+
+  function opAuth(user) {
+    var mijn = ++syncTeller;
+    clearTimeout(opslagTimer);
+    opslagOpen = false;
+
+    if (!user) {
+      gebruiker = null;
+      accountMand = {};
+      opgeslagenAdres = null;
+      mandGeladen = true;
+      cloudOk = true;
+      authKlaar = true;
+      route();
+      return;
+    }
+
+    gebruiker = user;
+    accountMand = {};
+    opgeslagenAdres = null;
+    mandGeladen = false;
+    cloudOk = true;
+
+    Promise.all([cloud.laadMand(user.uid), cloud.laadAdres(user.uid)]).then(
+      function (res) { klaarMetSync(mijn, true, res[0], res[1]); },
+      function (err) {
+        if (window.console) console.error('Laden uit Firestore mislukt', err);
+        klaarMetSync(mijn, false, null, null);
+      }
+    );
+  }
+
+  function klaarMetSync(mijn, gelukt, cloudMand, cloudAdres) {
+    if (mijn !== syncTeller || !gebruiker) return;
+
+    var samen = gelukt
+      ? schoonMand(cloudMand)
+      : schoonMand(store.get(cacheSleutel(gebruiker.uid), {}));
+
+    /* Winkelmand van de gast samenvoegen met de winkelmand van het account. */
+    var gast = schoonMand(store.get(GAST_MAND, {}));
+    var heeftGast = Object.keys(gast).length > 0;
+    Object.keys(gast).forEach(function (id) {
+      samen[id] = Math.min((samen[id] || 0) + gast[id], MAX_AANTAL);
+    });
+    if (heeftGast && gelukt) store.remove(GAST_MAND);
+
+    accountMand = samen;
+    store.set(cacheSleutel(gebruiker.uid), samen);
+    opgeslagenAdres = gelukt ? cloudAdres : null;
+    cloudOk = gelukt;
+    mandGeladen = true;
+    authKlaar = true;
+
+    if (gelukt) {
+      if (heeftGast) { opslagOpen = true; spoelOpslag(); }
+      cloud.bewaarProfiel(gebruiker.uid, { naam: gebruiker.naam, email: gebruiker.email })
+        .catch(function () { /* profiel is niet essentieel */ });
+    } else {
+      toast('Je accountgegevens konden niet worden geladen. Je winkelmand wordt nu alleen op dit apparaat bewaard.', 5000);
+    }
+
+    route();
+  }
+
   /* ---------- Header ---------- */
 
   function huidigPad() { return parseHash().pad; }
@@ -191,10 +256,9 @@
     var mandLink = document.querySelector('.basket-link');
     mandLink.setAttribute('aria-label', 'Winkelmand, ' + t.aantal + (t.aantal === 1 ? ' product' : ' producten'));
 
-    var u = huidigeGebruiker();
     var acc = document.getElementById('nav-account');
-    acc.textContent = u ? 'Mijn account' : 'Inloggen';
-    acc.setAttribute('href', u ? '#/account' : '#/inloggen');
+    acc.textContent = gebruiker ? 'Mijn account' : 'Inloggen';
+    acc.setAttribute('href', gebruiker ? '#/account' : '#/inloggen');
 
     var pad = huidigPad();
     document.querySelectorAll('.header-nav a').forEach(function (a) {
@@ -226,12 +290,23 @@
   var laatstePad = null;
 
   function route() {
+    if (!authKlaar) { toonLaden(); return; }
+
     var r = parseHash();
     var pad = r.pad;
-    var gebruiker = huidigeGebruiker();
 
     if (pad === '/account' && !gebruiker) { gaNaar('/inloggen'); return; }
-    if ((pad === '/inloggen' || pad === '/registreren') && gebruiker) { gaNaar('/account'); return; }
+    if ((pad === '/inloggen' || pad === '/registreren') && gebruiker) {
+      gaNaar(r.params.next ? veiligeVolgende(r.params.next) : '/account');
+      return;
+    }
+
+    /* Wacht tot de gegevens van het account zijn geladen. */
+    if (gebruiker && !mandGeladen && (pad === '/winkelmand' || pad === '/afrekenen' || pad === '/account')) {
+      toonLaden();
+      updateHeader();
+      return;
+    }
 
     switch (pad) {
       case '/':             renderCatalogus(); document.title = 'Shopwise – Boodschappen doen, slim en simpel'; break;
@@ -364,7 +439,6 @@
 
   function renderMandPagina() {
     var t = berekenTotalen();
-    var gebruiker = huidigeGebruiker();
 
     if (t.regels.length === 0) {
       app.innerHTML = '<h1 class="page-title">Winkelmand</h1>' +
@@ -390,9 +464,16 @@
         '</div></div>';
     }).join('');
 
-    var opslagTekst = gebruiker
-      ? 'Je winkelmand is gekoppeld aan je account (' + esc(gebruiker.email) + ').'
-      : 'Je winkelmand wordt op dit apparaat bewaard. <a href="#/inloggen?next=/winkelmand">Log in</a> om hem aan je account te koppelen.';
+    var opslagTekst;
+    var noticeKlasse = 'notice';
+    if (gebruiker && cloudOk) {
+      opslagTekst = 'Je winkelmand wordt bewaard in je account (' + esc(gebruiker.email) + ').';
+    } else if (gebruiker) {
+      opslagTekst = 'Let op: je account is niet bereikbaar. Je winkelmand wordt tijdelijk alleen op dit apparaat bewaard.';
+      noticeKlasse = 'notice warn';
+    } else {
+      opslagTekst = 'Je winkelmand wordt op dit apparaat bewaard. <a href="#/inloggen?next=/winkelmand">Log in</a> om hem aan je account te koppelen.';
+    }
 
     var knoppen = '<div class="actions-row">' +
       '<a class="btn btn-primary btn-block" href="#/afrekenen">Naar bezorgadres</a>' +
@@ -401,7 +482,7 @@
       '<p style="margin-top:1rem"><button type="button" class="btn-link" data-action="clear">Winkelmand leegmaken</button></p>';
 
     app.innerHTML = '<h1 class="page-title">Winkelmand</h1>' +
-      '<div class="notice">' + opslagTekst + '</div>' +
+      '<div class="' + noticeKlasse + '">' + opslagTekst + '</div>' +
       '<div class="two-col">' +
         '<section class="panel" aria-label="Producten in je winkelmand">' + regels + '</section>' +
         '<aside class="panel sticky" aria-label="Overzicht">' + samenvattingHtml(t, knoppen) + '</aside>' +
@@ -455,25 +536,100 @@
     return out;
   }
 
+  function toonFormFout(tekst) {
+    var el = document.getElementById('formfout');
+    if (el) el.textContent = tekst || '';
+  }
+
+  function zetBezig(knop, bezig) {
+    if (!knop) return;
+    knop.disabled = bezig;
+    if (bezig) {
+      knop.setAttribute('data-label', knop.textContent);
+      knop.textContent = 'Bezig…';
+    } else if (knop.hasAttribute('data-label')) {
+      knop.textContent = knop.getAttribute('data-label');
+    }
+  }
+
   var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
+  /* ---------- Foutmeldingen van Firebase in het Nederlands ---------- */
+
+  function foutTekst(err) {
+    var code = err && err.code ? err.code : '';
+    switch (code) {
+      case 'auth/email-already-in-use':
+        return 'Er bestaat al een account met dit e-mailadres.';
+      case 'auth/invalid-email':
+        return 'Vul een geldig e-mailadres in.';
+      case 'auth/weak-password':
+        return 'Je wachtwoord is te zwak. Kies minimaal 8 tekens.';
+      case 'auth/invalid-credential':
+      case 'auth/invalid-login-credentials':
+      case 'auth/wrong-password':
+      case 'auth/user-not-found':
+        return 'Onbekend e-mailadres of onjuist wachtwoord.';
+      case 'auth/user-disabled':
+        return 'Dit account is uitgeschakeld.';
+      case 'auth/too-many-requests':
+        return 'Te veel pogingen. Wacht even en probeer het later opnieuw.';
+      case 'auth/network-request-failed':
+        return 'Geen verbinding. Controleer je internet en probeer het opnieuw.';
+      case 'auth/popup-closed-by-user':
+        return 'Het inlogvenster is gesloten voordat je was ingelogd.';
+      case 'auth/cancelled-popup-request':
+        return '';
+      case 'auth/popup-blocked':
+        return 'Je browser blokkeerde het inlogvenster. Sta pop-ups toe voor deze website en probeer het opnieuw.';
+      case 'auth/unauthorized-domain':
+        return 'Dit domein is nog niet toegestaan in Firebase. Voeg het toe bij Authentication, Instellingen, Geautoriseerde domeinen.';
+      case 'auth/operation-not-allowed':
+        return 'Deze inlogmethode is nog niet ingeschakeld in Firebase.';
+      default:
+        return 'Er ging iets mis. Probeer het later opnieuw.';
+    }
+  }
+
+  function toonAuthFout(form, err) {
+    var code = err && err.code ? err.code : '';
+    var tekst = foutTekst(err);
+    if (!tekst) return;
+    if (code === 'auth/email-already-in-use' || code === 'auth/invalid-email') toonFouten(form, { email: tekst });
+    else if (code === 'auth/weak-password') toonFouten(form, { wachtwoord: tekst });
+    else toonFormFout(tekst);
+  }
+
   /* ---------- Inloggen & registreren ---------- */
+
+  function googleKnopHtml(volgende) {
+    return '<button type="button" class="btn btn-google btn-block" data-action="google" data-next="' + esc(volgende) + '">' +
+      '<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">' +
+      '<path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>' +
+      '<path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>' +
+      '<path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>' +
+      '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>' +
+      '</svg><span>Doorgaan met Google</span></button>';
+  }
 
   function renderInloggen(params) {
     var volgende = veiligeVolgende(params.next || '/');
     app.innerHTML = '<div class="auth-wrap"><div class="panel">' +
       '<h1>Inloggen</h1>' +
-      '<p class="muted">Log in om je winkelmand en bezorgadres aan je account te koppelen.</p>' +
-      '<div class="form-error" id="formfout" role="alert"></div>' +
+      '<p class="muted">Log in om je winkelmand en bezorgadres in je account te bewaren.</p>' +
+      '<div class="form-error" id="formfout" role="alert">' + (cloud ? '' : esc(CLOUD_UIT)) + '</div>' +
+      googleKnopHtml(volgende) +
+      '<div class="divider"><span>of</span></div>' +
       '<form id="form-inloggen" novalidate data-next="' + esc(volgende) + '">' +
         '<div class="form-grid">' +
-          veld({ id: 'email', label: 'E-mailadres', type: 'email', required: true, autocomplete: 'email', inputmode: 'email' }) +
+          veld({ id: 'email', label: 'E-mailadres', type: 'email', required: true, autocomplete: 'email', inputmode: 'email', maxlength: '120' }) +
           veld({ id: 'wachtwoord', label: 'Wachtwoord', type: 'password', required: true, autocomplete: 'current-password' }) +
         '</div>' +
+        '<p class="forgot"><button type="button" class="btn-link neutral" data-action="reset">Wachtwoord vergeten?</button></p>' +
         '<p style="margin-top:1rem"><button class="btn btn-primary btn-block" type="submit">Inloggen</button></p>' +
       '</form>' +
       '<p class="alt">Nog geen account? <a href="#/registreren?next=' + encodeURIComponent(volgende) + '">Account aanmaken</a></p>' +
-      '<p class="hint">Dit is een demo: accounts worden alleen in je eigen browser opgeslagen.</p>' +
+      '<p class="hint">Dit is een demo-winkel. Er worden geen echte bestellingen geplaatst.</p>' +
     '</div></div>';
   }
 
@@ -482,24 +638,21 @@
     app.innerHTML = '<div class="auth-wrap"><div class="panel">' +
       '<h1>Account aanmaken</h1>' +
       '<p class="muted">Maak gratis een demo-account aan.</p>' +
-      '<div class="form-error" id="formfout" role="alert"></div>' +
+      '<div class="form-error" id="formfout" role="alert">' + (cloud ? '' : esc(CLOUD_UIT)) + '</div>' +
+      googleKnopHtml(volgende) +
+      '<div class="divider"><span>of met e-mail</span></div>' +
       '<form id="form-registreren" novalidate data-next="' + esc(volgende) + '">' +
         '<div class="form-grid">' +
-          veld({ id: 'naam', label: 'Volledige naam', required: true, autocomplete: 'name' }) +
-          veld({ id: 'email', label: 'E-mailadres', type: 'email', required: true, autocomplete: 'email', inputmode: 'email' }) +
+          veld({ id: 'naam', label: 'Volledige naam', required: true, autocomplete: 'name', maxlength: '100' }) +
+          veld({ id: 'email', label: 'E-mailadres', type: 'email', required: true, autocomplete: 'email', inputmode: 'email', maxlength: '120' }) +
           veld({ id: 'wachtwoord', label: 'Wachtwoord', type: 'password', required: true, autocomplete: 'new-password', hint: 'Minimaal 8 tekens.' }) +
           veld({ id: 'herhaal', label: 'Herhaal wachtwoord', type: 'password', required: true, autocomplete: 'new-password' }) +
         '</div>' +
         '<p style="margin-top:1rem"><button class="btn btn-primary btn-block" type="submit">Account aanmaken</button></p>' +
       '</form>' +
       '<p class="alt">Heb je al een account? <a href="#/inloggen?next=' + encodeURIComponent(volgende) + '">Inloggen</a></p>' +
-      '<p class="hint">Gebruik geen echt wachtwoord: dit is alleen een demo.</p>' +
+      '<p class="hint">Met een account bewaren we je naam, e-mailadres, winkelmand en bezorgadres in Firebase (Google Cloud).</p>' +
     '</div></div>';
-  }
-
-  function toonFormFout(tekst) {
-    var el = document.getElementById('formfout');
-    if (el) el.textContent = tekst || '';
   }
 
   function verwerkInloggen(form) {
@@ -510,17 +663,22 @@
     if (!EMAIL_RE.test(email)) fouten.email = 'Vul een geldig e-mailadres in.';
     if (!w.wachtwoord) fouten.wachtwoord = 'Vul je wachtwoord in.';
     if (!toonFouten(form, fouten)) return;
+    if (!cloud) { toonFormFout(CLOUD_UIT); return; }
 
-    var gebruiker = getGebruikers().filter(function (u) { return u.email === email; })[0];
-    if (!gebruiker) { toonFormFout('Onbekend e-mailadres of onjuist wachtwoord.'); return; }
+    var knop = form.querySelector('button[type="submit"]');
+    zetBezig(knop, true);
+    var volgende = veiligeVolgende(form.getAttribute('data-next'));
 
-    hashWachtwoord(w.wachtwoord, gebruiker.salt).then(function (hash) {
-      if (hash !== gebruiker.hash) { toonFormFout('Onbekend e-mailadres of onjuist wachtwoord.'); return; }
-      store.set(SESSIE, gebruiker.email);
-      voegGastMandSamen();
-      toast('Welkom terug, ' + gebruiker.naam.split(' ')[0] + '!');
-      gaNaar(veiligeVolgende(form.getAttribute('data-next')));
-    });
+    cloud.inloggen(email, w.wachtwoord).then(
+      function () {
+        toast('Je bent ingelogd.');
+        gaNaar(volgende);
+      },
+      function (err) {
+        zetBezig(knop, false);
+        toonAuthFout(form, err);
+      }
+    );
   }
 
   function verwerkRegistreren(form) {
@@ -534,21 +692,75 @@
     if (w.wachtwoord.length < 8) fouten.wachtwoord = 'Je wachtwoord moet minimaal 8 tekens bevatten.';
     if (w.herhaal !== w.wachtwoord) fouten.herhaal = 'De wachtwoorden komen niet overeen.';
     if (!toonFouten(form, fouten)) return;
+    if (!cloud) { toonFormFout(CLOUD_UIT); return; }
 
-    var gebruikers = getGebruikers();
-    if (gebruikers.some(function (u) { return u.email === email; })) {
-      toonFouten(form, { email: 'Er bestaat al een account met dit e-mailadres.' });
+    var knop = form.querySelector('button[type="submit"]');
+    zetBezig(knop, true);
+    var volgende = veiligeVolgende(form.getAttribute('data-next'));
+
+    cloud.registreer(naam, email, w.wachtwoord).then(
+      function () {
+        toast('Je account is aangemaakt. Welkom, ' + naam.split(' ')[0] + '!');
+        gaNaar(volgende);
+      },
+      function (err) {
+        zetBezig(knop, false);
+        toonAuthFout(form, err);
+      }
+    );
+  }
+
+  function startGoogle(knop) {
+    toonFormFout('');
+    if (!cloud) { toonFormFout(CLOUD_UIT); return; }
+    var volgende = veiligeVolgende(knop.getAttribute('data-next'));
+    knop.disabled = true;
+    cloud.inloggenGoogle().then(
+      function () {
+        toast('Je bent ingelogd.');
+        gaNaar(volgende);
+      },
+      function (err) {
+        knop.disabled = false;
+        var tekst = foutTekst(err);
+        if (tekst) toonFormFout(tekst);
+      }
+    );
+  }
+
+  function startWachtwoordReset() {
+    var form = document.getElementById('form-inloggen');
+    var invoer = document.getElementById('email');
+    var email = invoer ? invoer.value.trim().toLowerCase() : '';
+    toonFormFout('');
+    if (!form) return;
+    if (!EMAIL_RE.test(email)) {
+      toonFouten(form, { email: 'Vul eerst je e-mailadres in.' });
       return;
     }
+    if (!cloud) { toonFormFout(CLOUD_UIT); return; }
+    cloud.resetWachtwoord(email).then(
+      function () {
+        toonFouten(form, {});
+        toast('Als dit e-mailadres bij een account hoort, is er een e-mail verstuurd.', 5000);
+      },
+      function (err) { toonFormFout(foutTekst(err)); }
+    );
+  }
 
-    var salt = maakSalt();
-    hashWachtwoord(w.wachtwoord, salt).then(function (hash) {
-      gebruikers.push({ naam: naam, email: email, salt: salt, hash: hash, aangemaakt: new Date().toISOString() });
-      store.set(GEBRUIKERS, gebruikers);
-      store.set(SESSIE, email);
-      voegGastMandSamen();
-      toast('Je account is aangemaakt. Welkom, ' + naam.split(' ')[0] + '!');
-      gaNaar(veiligeVolgende(form.getAttribute('data-next')));
+  function logUit() {
+    if (!cloud || !gebruiker) return;
+    var uid = gebruiker.uid;
+    spoelOpslag().then(function () {
+      return cloud.uitloggen();
+    }).then(function () {
+      store.remove(cacheSleutel(uid));
+      try { sessionStorage.removeItem(BESTELLING); } catch (e) { /* negeren */ }
+      delete geheugen[BESTELLING];
+      toast('Je bent uitgelogd');
+      gaNaar('/');
+    }, function () {
+      toast('Uitloggen is niet gelukt. Probeer het opnieuw.');
     });
   }
 
@@ -560,15 +772,15 @@
   }
 
   function renderAccount() {
-    var u = huidigeGebruiker();
-    var adres = store.get(adresSleutel(u.email), null);
+    var u = gebruiker;
+    var via = u.provider === 'google.com' ? 'Ingelogd met Google' : 'Ingelogd met e-mail en wachtwoord';
     app.innerHTML = '<h1 class="page-title">Mijn account</h1>' +
       '<div class="two-col">' +
         '<section class="panel"><h2>Gegevens</h2>' +
-          '<p><strong>' + esc(u.naam) + '</strong><br><span class="muted">' + esc(u.email) + '</span></p>' +
+          '<p><strong>' + esc(u.naam) + '</strong><br><span class="muted">' + esc(u.email) + '</span><br><span class="muted">' + via + '</span></p>' +
           '<h2 style="margin-top:1.25rem">Opgeslagen bezorgadres</h2>' +
-          (adres
-            ? '<div class="address-box">' + adresHtml(adres) + '</div>' +
+          (opgeslagenAdres
+            ? '<div class="address-box">' + adresHtml(opgeslagenAdres) + '</div>' +
               '<p style="margin-top:0.75rem"><button type="button" class="btn-link" data-action="delete-address">Adres verwijderen</button></p>'
             : '<p class="muted">Je hebt nog geen bezorgadres opgeslagen. Dat kun je doen tijdens het afrekenen.</p>') +
         '</section>' +
@@ -579,6 +791,18 @@
           '</div>' +
         '</aside>' +
       '</div>';
+  }
+
+  function verwijderOpgeslagenAdres() {
+    if (!gebruiker || !cloud) return;
+    cloud.verwijderAdres(gebruiker.uid).then(
+      function () {
+        opgeslagenAdres = null;
+        toast('Adres verwijderd');
+        if (gebruiker && huidigPad() === '/account') renderAccount();
+      },
+      function () { toast('Het adres kon niet worden verwijderd.', 4000); }
+    );
   }
 
   /* ---------- Afrekenen (bezorgadres) ---------- */
@@ -611,8 +835,8 @@
       return;
     }
 
-    var u = huidigeGebruiker();
-    var a = u ? (store.get(adresSleutel(u.email), null) || {}) : {};
+    var u = gebruiker;
+    var a = u ? (opgeslagenAdres || {}) : {};
     var delen = u ? u.naam.split(' ') : [];
     var voornaam = a.voornaam || (delen.length ? delen[0] : '');
     var achternaam = a.achternaam || (delen.length > 1 ? delen.slice(1).join(' ') : '');
@@ -630,23 +854,28 @@
       return '<div class="summary-row"><span>' + r.aantal + '× ' + esc(r.product.naam) + '</span><span>' + eur(r.totaal) + '</span></div>';
     }).join('');
 
+    var opslaanHtml = '';
+    if (u && cloudOk) {
+      opslaanHtml = '<label class="check" style="margin-bottom:1rem"><input type="checkbox" name="opslaan" checked> Bewaar dit adres in mijn account</label>';
+    }
+
     app.innerHTML = '<h1 class="page-title">Bezorgadres</h1>' + gastMelding +
       '<div class="notice warn"><strong>Demo:</strong> er wordt niets besteld en er wordt niet betaald.</div>' +
       '<div class="two-col">' +
         '<form class="panel" id="form-afrekenen" novalidate>' +
           '<div class="form-error" id="formfout" role="alert"></div>' +
           '<fieldset><legend>Jouw gegevens</legend><div class="form-grid cols-2">' +
-            veld({ id: 'voornaam', label: 'Voornaam', required: true, autocomplete: 'given-name', value: voornaam }) +
-            veld({ id: 'achternaam', label: 'Achternaam', required: true, autocomplete: 'family-name', value: achternaam }) +
-            veld({ id: 'email', label: 'E-mailadres', type: 'email', required: true, autocomplete: 'email', inputmode: 'email', value: email }) +
-            veld({ id: 'telefoon', label: 'Telefoonnummer', type: 'tel', autocomplete: 'tel', inputmode: 'tel', value: a.telefoon || '', placeholder: '06 12345678' }) +
+            veld({ id: 'voornaam', label: 'Voornaam', required: true, autocomplete: 'given-name', maxlength: '60', value: voornaam }) +
+            veld({ id: 'achternaam', label: 'Achternaam', required: true, autocomplete: 'family-name', maxlength: '80', value: achternaam }) +
+            veld({ id: 'email', label: 'E-mailadres', type: 'email', required: true, autocomplete: 'email', inputmode: 'email', maxlength: '120', value: email }) +
+            veld({ id: 'telefoon', label: 'Telefoonnummer', type: 'tel', autocomplete: 'tel', inputmode: 'tel', maxlength: '30', value: a.telefoon || '', placeholder: '06 12345678' }) +
           '</div></fieldset>' +
           '<fieldset><legend>Bezorgadres in Nederland</legend><div class="form-grid cols-2">' +
             veld({ id: 'postcode', label: 'Postcode', required: true, autocomplete: 'postal-code', maxlength: '7', value: a.postcode || '', placeholder: '1234 AB' }) +
             veld({ id: 'huisnummer', label: 'Huisnummer', required: true, inputmode: 'numeric', maxlength: '5', value: a.huisnummer || '' }) +
             veld({ id: 'toevoeging', label: 'Toevoeging', maxlength: '6', value: a.toevoeging || '', placeholder: 'bijv. A of 2' }) +
-            veld({ id: 'straat', label: 'Straatnaam', required: true, autocomplete: 'address-line1', value: a.straat || '' }) +
-            veld({ id: 'woonplaats', label: 'Woonplaats', required: true, autocomplete: 'address-level2', value: a.woonplaats || '', span2: true }) +
+            veld({ id: 'straat', label: 'Straatnaam', required: true, autocomplete: 'address-line1', maxlength: '80', value: a.straat || '' }) +
+            veld({ id: 'woonplaats', label: 'Woonplaats', required: true, autocomplete: 'address-level2', maxlength: '60', value: a.woonplaats || '', span2: true }) +
           '</div></fieldset>' +
           '<fieldset><legend>Bezorgmoment</legend><div class="form-grid cols-2">' +
             '<div class="field"><label for="bezorgdag">Bezorgdag</label><select id="bezorgdag" name="bezorgdag">' + dagen + '</select></div>' +
@@ -654,7 +883,7 @@
             '<div class="field span-2"><label for="opmerking">Opmerking voor de bezorger <span class="optional">(optioneel)</span></label>' +
               '<textarea id="opmerking" name="opmerking" maxlength="200" placeholder="Bijvoorbeeld: bel aan bij de buren"></textarea></div>' +
           '</div></fieldset>' +
-          (u ? '<label class="check" style="margin-bottom:1rem"><input type="checkbox" name="opslaan" checked> Bewaar dit adres in mijn account</label>' : '') +
+          opslaanHtml +
           '<button class="btn btn-primary btn-block" type="submit">Demo-bestelling plaatsen</button>' +
         '</form>' +
         '<aside class="panel sticky" aria-label="Samenvatting van je bestelling"><h2>Je bestelling</h2>' + regelsHtml +
@@ -667,16 +896,33 @@
 
   function valideerAdres(w) {
     var f = {};
-    if (!w.voornaam.trim()) f.voornaam = 'Vul je voornaam in.';
-    if (!w.achternaam.trim()) f.achternaam = 'Vul je achternaam in.';
-    if (!EMAIL_RE.test(w.email.trim())) f.email = 'Vul een geldig e-mailadres in.';
+    var voornaam = w.voornaam.trim();
+    var achternaam = w.achternaam.trim();
+    var straat = w.straat.trim();
+    var plaats = w.woonplaats.trim();
+    var mail = w.email.trim();
+
+    if (!voornaam) f.voornaam = 'Vul je voornaam in.';
+    else if (voornaam.length > 60) f.voornaam = 'Je voornaam mag maximaal 60 tekens bevatten.';
+
+    if (!achternaam) f.achternaam = 'Vul je achternaam in.';
+    else if (achternaam.length > 80) f.achternaam = 'Je achternaam mag maximaal 80 tekens bevatten.';
+
+    if (!EMAIL_RE.test(mail) || mail.length > 120) f.email = 'Vul een geldig e-mailadres in.';
+
     var tel = w.telefoon.replace(/[\s\-()]/g, '');
-    if (tel && !/^(\+31|0031|0)[1-9][0-9]{8}$/.test(tel)) f.telefoon = 'Vul een geldig Nederlands telefoonnummer in, bijvoorbeeld 06 12345678.';
+    if (tel && (!/^(\+31|0031|0)[1-9][0-9]{8}$/.test(tel) || w.telefoon.trim().length > 30)) {
+      f.telefoon = 'Vul een geldig Nederlands telefoonnummer in, bijvoorbeeld 06 12345678.';
+    }
     if (!/^[1-9][0-9]{3}\s?[A-Za-z]{2}$/.test(w.postcode.trim())) f.postcode = 'Vul een geldige postcode in, bijvoorbeeld 1234 AB.';
     if (!/^[1-9][0-9]{0,4}$/.test(w.huisnummer.trim())) f.huisnummer = 'Vul een geldig huisnummer in (alleen cijfers).';
     if (w.toevoeging.trim().length > 6) f.toevoeging = 'De toevoeging mag maximaal 6 tekens bevatten.';
-    if (w.straat.trim().length < 2) f.straat = 'Vul je straatnaam in.';
-    if (w.woonplaats.trim().length < 2) f.woonplaats = 'Vul je woonplaats in.';
+
+    if (straat.length < 2) f.straat = 'Vul je straatnaam in.';
+    else if (straat.length > 80) f.straat = 'De straatnaam mag maximaal 80 tekens bevatten.';
+
+    if (plaats.length < 2) f.woonplaats = 'Vul je woonplaats in.';
+    else if (plaats.length > 60) f.woonplaats = 'De woonplaats mag maximaal 60 tekens bevatten.';
     return f;
   }
 
@@ -691,7 +937,7 @@
     if (t.regels.length === 0) { gaNaar('/winkelmand'); return; }
 
     var pc = w.postcode.replace(/\s/g, '').toUpperCase();
-    var adres = {
+    var adresGegevens = {
       voornaam: w.voornaam.trim(),
       achternaam: w.achternaam.trim(),
       email: w.email.trim().toLowerCase(),
@@ -703,15 +949,20 @@
       woonplaats: w.woonplaats.trim()
     };
 
-    var u = huidigeGebruiker();
-    if (u && w.opslaan) store.set(adresSleutel(u.email), adres);
+    if (gebruiker && cloud && cloudOk && w.opslaan) {
+      var uid = gebruiker.uid;
+      opgeslagenAdres = adresGegevens;
+      cloud.bewaarAdres(uid, adresGegevens).catch(function () {
+        toast('Je adres kon niet worden opgeslagen in je account.', 4000);
+      });
+    }
 
     var dagSelect = form.querySelector('#bezorgdag');
     var dagLabel = dagSelect.options[dagSelect.selectedIndex].text;
 
     var bestelling = {
       nummer: 'SW-' + Date.now().toString(36).toUpperCase().slice(-6),
-      adres: adres,
+      adres: adresGegevens,
       dag: dagLabel,
       tijdvak: w.tijdvak,
       opmerking: w.opmerking.trim(),
@@ -777,8 +1028,7 @@
 
     switch (actie) {
       case 'add':
-        wijzigAantal(id, 1);
-        toast(productMap[id].naam + ' toegevoegd');
+        if (wijzigAantal(id, 1)) toast(productMap[id].naam + ' toegevoegd');
         naMandWijziging();
         break;
       case 'inc':
@@ -813,17 +1063,17 @@
         zoekveld.value = '';
         renderCatalogus();
         break;
+      case 'google':
+        startGoogle(el);
+        break;
+      case 'reset':
+        startWachtwoordReset();
+        break;
       case 'logout':
-        store.remove(SESSIE);
-        toast('Je bent uitgelogd');
-        gaNaar('/');
-        updateHeader();
+        logUit();
         break;
       case 'delete-address':
-        var u = huidigeGebruiker();
-        if (u) store.remove(adresSleutel(u.email));
-        toast('Adres verwijderd');
-        renderAccount();
+        verwijderOpgeslagenAdres();
         break;
     }
   });
@@ -858,5 +1108,27 @@
   window.addEventListener('hashchange', route);
   window.addEventListener('storage', function () { updateHeader(); });
 
-  route();
+  /* Wijzigingen in de winkelmand direct opslaan als de pagina op de achtergrond gaat. */
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') spoelOpslag();
+  });
+  window.addEventListener('pagehide', function () { spoelOpslag(); });
+
+  /* ---------- Start ---------- */
+
+  /* Oude lokale demo-accounts uit de eerste versie opruimen. */
+  store.remove('shopwise_gebruikers');
+  store.remove('shopwise_sessie');
+
+  if (cloud) {
+    toonLaden();
+    cloud.onAuth(opAuth);
+    /* Vangnet: als Firebase niet reageert, toch de winkel tonen. */
+    setTimeout(function () {
+      if (!authKlaar) { authKlaar = true; route(); }
+    }, 8000);
+  } else {
+    authKlaar = true;
+    route();
+  }
 })();
