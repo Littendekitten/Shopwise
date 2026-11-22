@@ -1,5 +1,5 @@
-/* Shopwise – Firebase (Authentication, Firestore, Analytics)
-   Gebruikt de officiële Firebase-modules via de CDN, dus zonder npm of build. */
+/* Shopwise – Firebase Authentication, Firestore en optionele Analytics.
+   Gebruikt de officiële Firebase-modules via de CDN, zonder npm of build. */
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
 import {
@@ -18,7 +18,6 @@ import {
   doc,
   getDoc,
   setDoc,
-  deleteDoc,
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 
@@ -86,7 +85,6 @@ onAuthStateChanged(auth, function (user) {
 
 function profielRef(uid) { return doc(db, "users", uid); }
 function mandRef(uid) { return doc(db, "users", uid, "baskets", "current"); }
-function adresRef(uid) { return doc(db, "users", uid, "addresses", "default"); }
 
 function tekst(waarde, max) {
   return String(waarde == null ? "" : waarde).slice(0, max);
@@ -152,42 +150,5 @@ window.ShopwiseCloud = {
       items: items,
       bijgewerkt: serverTimestamp()
     });
-  },
-
-  /* Nederlands bezorgadres */
-  laadAdres: async function (uid) {
-    const snap = await getDoc(adresRef(uid));
-    if (!snap.exists()) return null;
-    const d = snap.data() || {};
-    return {
-      voornaam: d.voornaam || "",
-      achternaam: d.achternaam || "",
-      email: d.email || "",
-      telefoon: d.telefoon || "",
-      postcode: d.postcode || "",
-      huisnummer: d.huisnummer || "",
-      toevoeging: d.toevoeging || "",
-      straat: d.straat || "",
-      woonplaats: d.woonplaats || ""
-    };
-  },
-
-  bewaarAdres: function (uid, a) {
-    return setDoc(adresRef(uid), {
-      voornaam: tekst(a.voornaam, 60),
-      achternaam: tekst(a.achternaam, 80),
-      email: tekst(a.email, 120),
-      telefoon: tekst(a.telefoon, 30),
-      postcode: tekst(a.postcode, 7),
-      huisnummer: tekst(a.huisnummer, 5),
-      toevoeging: tekst(a.toevoeging, 6),
-      straat: tekst(a.straat, 80),
-      woonplaats: tekst(a.woonplaats, 60),
-      bijgewerkt: serverTimestamp()
-    });
-  },
-
-  verwijderAdres: function (uid) {
-    return deleteDoc(adresRef(uid));
   }
 };
