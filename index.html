@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shopwise – Boodschappen doen, slim en simpel</title>
+  <meta name="description" content="Shopwise is een demo-webwinkel voor boodschappen in Nederland. Er worden geen echte bestellingen geplaatst.">
+  <meta name="theme-color" content="#16a34a">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%9B%92%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#app">Ga naar de inhoud</a>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="#/" aria-label="Shopwise, naar de startpagina">
+        <span class="brand-mark" aria-hidden="true">🛒</span>
+        <span class="brand-name">Shopwise</span>
+      </a>
+
+      <form class="header-search" id="zoekformulier" role="search" autocomplete="off">
+        <label class="sr-only" for="zoekveld">Zoek producten</label>
+        <input id="zoekveld" type="search" placeholder="Zoek producten, bijvoorbeeld melk" enterkeyhint="search">
+      </form>
+
+      <nav class="header-nav" aria-label="Hoofdmenu">
+        <a href="#/" data-nav="/">Producten</a>
+        <a id="nav-account" href="#/inloggen" data-nav="account">Inloggen</a>
+        <a class="basket-link" href="#/winkelmand" data-nav="/winkelmand" aria-label="Winkelmand">
+          <span aria-hidden="true">🧺</span>
+          <span class="basket-text">Winkelmand</span>
+          <span id="mandteller" class="badge" aria-live="polite">0</span>
+        </a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="app" tabindex="-1"></main>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <p><strong>Shopwise</strong> is een demo-project. Er worden geen echte bestellingen geplaatst en er zijn geen betalingen.</p>
+      <p class="muted">Gratis bezorging vanaf € 50,00 · Bezorgd in heel Nederland (demo)</p>
+    </div>
+  </footer>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <noscript>
+    <p style="padding:1rem;text-align:center">Shopwise heeft JavaScript nodig om te werken. Schakel JavaScript in en laad de pagina opnieuw.</p>
+  </noscript>
+
+  <script src="js/products.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
